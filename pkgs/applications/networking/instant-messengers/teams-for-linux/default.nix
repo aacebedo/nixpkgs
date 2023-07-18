@@ -17,24 +17,19 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "teams-for-linux";
-  version = "1.2.4";
+  version = "1.2.5";
 
   src = fetchFromGitHub {
     owner = "IsmaelMartinez";
     repo = "teams-for-linux";
     rev = "v${finalAttrs.version}";
-    hash = "sha256-x5OYSU396FIgFbs4VchEpKI8Xv0mk2XPraejBgzWta0=";
+    hash = "sha256-CLP0DSzFIYlE2rRO1P7lm31GDdAfGZ/LpFYOSlUVLeY=";
   };
 
   offlineCache = fetchYarnDeps {
     yarnLock = "${finalAttrs.src}/yarn.lock";
-    hash = "sha256-HiNBXDQuPM8MnSkxYS5f+kop5QeUintNPBWtp6uhiz8=";
+    hash = "sha256-XUASMWrH8wWeYsr6gCdQGgV/7E6hLDWkJ0BXHZCepKQ=";
   };
-
-  patches = [
-    # Can be removed once Electron upstream resolves https://github.com/electron/electron/issues/36660
-    ./screensharing-wayland-hack-fix.patch
-  ];
 
   nativeBuildInputs = [ yarn fixup_yarn_lock nodejs copyDesktopItems makeWrapper ];
 
