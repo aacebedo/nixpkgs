@@ -1,0 +1,177 @@
+diff --git a/apps/native/src-tauri/src/autostart.rs b/apps/native/src-tauri/src/autostart.rs
+index 5e29d07..e3ce745 100644
+--- a/apps/native/src-tauri/src/autostart.rs
++++ b/apps/native/src-tauri/src/autostart.rs
+@@ -46,6 +46,8 @@ pub(crate) fn sync_autostart(app: &tauri::AppHandle) {
+         if manager.enable().is_ok() {
+             #[cfg(windows)]
+             quote_login_entry(app);
++            #[cfg(target_os = "linux")]
++            nix_login_entry(app);
+         }
+     } else if manager.is_enabled().unwrap_or(false) {
+         // Gated on is_enabled: the underlying crate's Windows `disable()` deletes
+@@ -57,6 +59,31 @@ pub(crate) fn sync_autostart(app: &tauri::AppHandle) {
+ #[cfg(not(desktop))]
+ pub(crate) fn sync_autostart(_app: &tauri::AppHandle) {}
+ 
++/// nixpkgs: the autostart plugin writes the running binary's path, which is in
++/// the Nix store, unwrapped, and gone after the next garbage collection. Point
++/// the entry at the command the wrapper names instead (looked up on PATH).
++#[cfg(all(desktop, target_os = "linux"))]
++fn nix_login_entry(app: &tauri::AppHandle) {
++    let Some(exec) = std::env::var_os("XENON_AUTOSTART_EXEC") else { return };
++    let Some(home) = std::env::var_os("HOME") else { return };
++    let file = std::path::Path::new(&home)
++        .join(".config/autostart")
++        .join(format!("{}.desktop", app.package_info().name));
++    let Ok(text) = std::fs::read_to_string(&file) else { return };
++    let exec = exec.to_string_lossy();
++    let rewritten: Vec<String> = text
++        .lines()
++        .map(|line| {
++            if line.starts_with("Exec=") {
++                format!("Exec={exec} --autostart")
++            } else {
++                line.to_string()
++            }
++        })
++        .collect();
++    let _ = std::fs::write(&file, rewritten.join("\n"));
++}
++
+ /// Rewrite the Windows login entry with the program path in quotes.
+ ///
+ /// The autostart crate writes `C:\Users\John Smith\...\xenon-native.exe --autostart`
+diff --git a/apps/native/src-tauri/src/backend_nudge_linux.rs b/apps/native/src-tauri/src/backend_nudge_linux.rs
+index 356f066..7d410cb 100644
+--- a/apps/native/src-tauri/src/backend_nudge_linux.rs
++++ b/apps/native/src-tauri/src/backend_nudge_linux.rs
+@@ -28,6 +28,11 @@ pub(crate) fn spawn_backend_nudge(app: &tauri::AppHandle, port: u16) {
+         if backend_answers(port) {
+             return;
+         }
++        // nixpkgs: the engine is in the Nix store, named by the wrapper.
++        if let Some(backend) = std::env::var_os("XENON_BACKEND") {
++            start_nix_backend(&backend, port);
++            return;
++        }
+         if port != 3030 {
+             return;
+         }
+@@ -68,6 +73,80 @@ pub(crate) fn spawn_backend_nudge(app: &tauri::AppHandle, port: u16) {
+     });
+ }
+ 
++/// nixpkgs: pid of the engine process this app started, 0 when none.
++#[cfg(target_os = "linux")]
++static BACKEND_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++
++/// nixpkgs: start the engine the package ships. A `systemd --user` unit named
++/// `xenon-backend.service` that the user enabled (NixOS `systemd.packages`,
++/// home-manager) owns it and keeps it running without the window; otherwise it
++/// runs as this app's child for as long as the app does.
++///
++/// Runs on the nudge thread and keeps it until the engine exits: the child asks
++/// the kernel for SIGTERM when its parent goes (PR_SET_PDEATHSIG), so an app
++/// that is killed rather than quit (logout, a crash) does not leave the engine
++/// holding the port, and that signal fires when the spawning THREAD ends.
++#[cfg(target_os = "linux")]
++fn start_nix_backend(backend: &std::ffi::OsStr, port: u16) {
++    use std::os::unix::process::CommandExt;
++    use std::sync::atomic::Ordering;
++    let systemctl = |args: &[&str]| {
++        std::process::Command::new("systemctl")
++            .arg("--user")
++            .args(args)
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .status()
++            .map(|s| s.success())
++            .unwrap_or(false)
++    };
++    if systemctl(&["--quiet", "is-enabled", "xenon-backend.service"])
++        && systemctl(&["start", "xenon-backend.service"])
++    {
++        return;
++    }
++    let mut command = std::process::Command::new(backend);
++    command.env("XENON_PORT", port.to_string());
++    // SAFETY: prctl is async-signal-safe and touches no memory of the parent.
++    unsafe {
++        command.pre_exec(|| {
++            extern "C" {
++                fn prctl(option: std::os::raw::c_int, ...) -> std::os::raw::c_int;
++            }
++            const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
++            const SIGTERM: std::os::raw::c_ulong = 15;
++            prctl(PR_SET_PDEATHSIG, SIGTERM);
++            Ok(())
++        });
++    }
++    let Ok(mut child) = command.spawn() else { return };
++    let pid = child.id();
++    BACKEND_PID.store(pid, Ordering::SeqCst);
++    let _ = child.wait();
++    let _ = BACKEND_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
++}
++
++/// nixpkgs: stop the engine this app started (see `start_nix_backend`). SIGTERM
++/// lets server.js shut its own children down; waits until it is gone, so a
++/// restart finds the port free. Idempotent.
++#[cfg(target_os = "linux")]
++pub fn stop_owned_backend() {
++    let pid = BACKEND_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
++    if pid == 0 {
++        return;
++    }
++    let _ = std::process::Command::new("kill")
++        .args(["-TERM", &pid.to_string()])
++        .status();
++    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
++    for _ in 0..100 {
++        if !proc_dir.exists() {
++            break;
++        }
++        std::thread::sleep(std::time::Duration::from_millis(100));
++    }
++}
++
+ /// Open `script` in whatever terminal emulator this desktop has, running it
+ /// through `bash` so neither the executable bit (Tauri copies resources without
+ /// it) nor the shebang has to be right.
+diff --git a/apps/native/src-tauri/src/lib.rs b/apps/native/src-tauri/src/lib.rs
+index 7194fc8..23876b6 100644
+--- a/apps/native/src-tauri/src/lib.rs
++++ b/apps/native/src-tauri/src/lib.rs
+@@ -112,9 +112,11 @@ pub(crate) fn system32_exe(name: &str) -> std::path::PathBuf {
+ }
+ 
+ /// No-op twin so every caller can say "stop what we own" without a `cfg`. Only
+-/// macOS ever owns the backend process.
+-#[cfg(not(target_os = "macos"))]
++/// macOS (and the nixpkgs build on Linux) ever owns the backend process.
++#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+ pub fn stop_owned_backend() {}
++#[cfg(target_os = "linux")]
++pub use backend_nudge_linux::stop_owned_backend;
+ 
+ #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+ fn spawn_backend_nudge(_app: &tauri::AppHandle, _port: u16) {}
+diff --git a/apps/native/src-tauri/src/shell_update.rs b/apps/native/src-tauri/src/shell_update.rs
+index c5cc02c..ac1d376 100644
+--- a/apps/native/src-tauri/src/shell_update.rs
++++ b/apps/native/src-tauri/src/shell_update.rs
+@@ -262,9 +262,11 @@ pub(crate) static LEGACY_RESCUE_STARTED: std::sync::atomic::AtomicBool = std::sy
+ /// and try to overwrite /usr/bin/xenon-native in place. The dashboard reads this
+ /// as `shellSelfUpdate` and skips the app phase; the backend still updates.
+ pub(crate) fn shell_self_update() -> bool {
++    // nixpkgs: the binary is stamped as a .deb by the build, but it lives in the
++    // read-only Nix store and is updated by Nix.
+     #[cfg(target_os = "linux")]
+     {
+-        tauri::utils::platform::bundle_type().is_some()
++        false
+     }
+     #[cfg(not(target_os = "linux"))]
+     {

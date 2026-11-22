@@ -1,0 +1,151 @@
+diff --git a/server/ai/local-stt.js b/server/ai/local-stt.js
+index 22806cf..ebdcbb1 100644
+--- a/server/ai/local-stt.js
++++ b/server/ai/local-stt.js
+@@ -19,7 +19,7 @@ const WHISPER_BIN_NAMES = process.platform === 'win32'
+ // LaunchAgent that runs this server.
+ const WHISPER_SYSTEM_DIRS = process.platform === 'win32'
+   ? []
+-  : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
++  : [...(process.env.PATH || '').split(':').filter(Boolean), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin'];
+ 
+ // Only the unambiguous name is looked for in a shared bin directory. `whisper`
+ // there is far more likely to be the OpenAI Python CLI, which takes completely
+@@ -33,7 +33,7 @@ const WHISPER_SYSTEM_BIN_NAMES = ['whisper-cli'];
+ // always ours: Homebrew ships the binary but no ggml weights, so the download
+ // below owns the model on every platform.
+ function whisperPaths(serverDir) {
+-  const dir = path.join(serverDir, 'whisper');
++  const dir = path.join(require('../engine/paths.js').DATA_DIR, 'whisper');
+   return { dir, exe: path.join(dir, WHISPER_BIN_NAMES[0]), model: path.join(dir, 'ggml-small.bin') };
+ }
+ 
+@@ -41,7 +41,7 @@ function whisperPaths(serverDir) {
+ // bundled copy wins over a system one, so a user who drops a specific build into
+ // server/whisper/ keeps using it.
+ function whisperExe(serverDir) {
+-  const dir = path.join(serverDir, 'whisper');
++  const dir = path.join(require('../engine/paths.js').DATA_DIR, 'whisper');
+   for (const name of WHISPER_BIN_NAMES) {
+     const p = path.join(dir, name);
+     try { if (fs.existsSync(p)) return p; } catch { /* ignore */ }
+diff --git a/server/claude-link.js b/server/claude-link.js
+index 143cdc2..505cbb6 100644
+--- a/server/claude-link.js
++++ b/server/claude-link.js
+@@ -238,7 +238,7 @@ if (require.main === module) {
+     console.error('usage: node claude-link.js unlink');
+     process.exit(2);
+   }
+-  const dataDir = path.join(__dirname, 'data');
++  const dataDir = require('./engine/paths.js').DATA_DIR;
+   // Same rule server.js uses, so a hub moved off 3030 unlinks the hooks it
+   // actually wrote (they carry the port in their URL).
+   const rawPort = parseInt(process.env.XENON_PORT, 10);
+diff --git a/server/claude-statusline.js b/server/claude-statusline.js
+index bedf370..e884cd2 100644
+--- a/server/claude-statusline.js
++++ b/server/claude-statusline.js
+@@ -22,7 +22,7 @@ const path = require('path');
+ const http = require('http');
+ const { spawn } = require('child_process');
+ 
+-const STATE_FILE = path.join(__dirname, 'data', 'claude-bridge.json');
++const STATE_FILE = path.join(require('./engine/paths.js').DATA_DIR, 'claude-bridge.json');
+ const POST_TIMEOUT_MS = 1500;   // the hub is on loopback; never wait longer
+ const CHAIN_TIMEOUT_MS = 3000;  // the user's own statusline gets a bit more room
+ const HARD_EXIT_MS = 4500;      // absolute ceiling for this process
+diff --git a/server/codex-hook.js b/server/codex-hook.js
+index b85d6ac..06897d9 100644
+--- a/server/codex-hook.js
++++ b/server/codex-hook.js
+@@ -33,7 +33,7 @@ function done() { process.exit(0); }
+ 
+ function readState() {
+   try {
+-    const s = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'codex-bridge.json'), 'utf8'));
++    const s = JSON.parse(fs.readFileSync(path.join(require('./engine/paths.js').DATA_DIR, 'codex-bridge.json'), 'utf8'));
+     const port = Number.isInteger(s.port) && s.port > 0 && s.port <= 65535 ? s.port : 3030;
+     return typeof s.token === 'string' && s.token.length >= 32 ? { token: s.token, port } : null;
+   } catch { return null; }
+diff --git a/server/codex-link.js b/server/codex-link.js
+index 49461fe..bd895e5 100644
+--- a/server/codex-link.js
++++ b/server/codex-link.js
+@@ -210,7 +210,7 @@ if (require.main === module) {
+     console.error('usage: node codex-link.js unlink');
+     process.exit(2);
+   }
+-  const dataDir = path.join(__dirname, 'data');
++  const dataDir = require('./engine/paths.js').DATA_DIR;
+   (async () => {
+     const before = await status(dataDir);
+     if (!before.linked) { console.log('not-linked'); return; }
+diff --git a/server/engine/paths.js b/server/engine/paths.js
+index bbde4c4..cb89eff 100644
+--- a/server/engine/paths.js
++++ b/server/engine/paths.js
+@@ -1,6 +1,7 @@
+ // Where the engine keeps the user's data, and where the helper program and the bridge for
+ // coding tools sit next to it.
+ 
++const os = require('node:os');
+ const path = require('node:path');
+ 
+ const SERVER_DIR = path.join(__dirname, '..');
+@@ -18,7 +19,14 @@ const HELPER_EXE = path.join(SERVER_DIR, 'helper',
+ // All runtime user data (settings, notes, calendar, tasks, timers, deck, uploads,
+ // streaming config/tokens) lives in a single DATA_DIR instead of being scattered
+ // loose in server/. Tool binaries (presentmon/, whisper/, vendor/, …) stay put.
+-const DATA_DIR = path.join(SERVER_DIR, 'data');
++//
++// nixpkgs: the install tree lives in the read-only Nix store, so user data goes
++// to $XENON_DATA_DIR, or $XDG_DATA_HOME/xenon-dashboard (~/.local/share/...).
++// Computed here without any environment set by a wrapper, so the hook scripts
++// coding tools run (claude-statusline.js, codex-hook.js) find the same folder.
++const DATA_DIR = process.env.XENON_DATA_DIR
++  ? path.resolve(process.env.XENON_DATA_DIR)
++  : path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'xenon-dashboard');
+ 
+ // The bridge as this install ships it, for Settings' one-click connect.
+ const MCP_BRIDGE_PATH = path.join(SERVER_DIR, '..', 'packages', 'mcp', 'bin', 'xenon-mcp.js');
+diff --git a/server/engine/startup-log.js b/server/engine/startup-log.js
+index 9a4f94c..e03664f 100644
+--- a/server/engine/startup-log.js
++++ b/server/engine/startup-log.js
+@@ -42,7 +42,7 @@ function logDir() {
+   if (process.platform === 'win32' && process.env.LOCALAPPDATA) {
+     return path.join(process.env.LOCALAPPDATA, 'Xenon');
+   }
+-  return path.join(__dirname, '..', 'data');
++  return require('./paths.js').DATA_DIR;
+ }
+ 
+ const LOG = path.join(logDir(), 'server.log');
+diff --git a/server/screens/capture-engine-install.js b/server/screens/capture-engine-install.js
+index 53fc99b..de94a9c 100644
+--- a/server/screens/capture-engine-install.js
++++ b/server/screens/capture-engine-install.js
+@@ -28,7 +28,8 @@ function ensureCaptureEngine(attempt = 1) {
+     let marked = '';
+     try { marked = fs.readFileSync(CAPTURE_CHECK_MARKER, 'utf8').trim(); } catch { /* first run */ }
+     const present = fs.existsSync(CAPTURE_EXE);
+-    if (present && marked === APP_VERSION) { learnCaptureFeatures(); return; }
++    // nixpkgs: the engine is built with the package and the store is read-only.
++    if (present) { learnCaptureFeatures(); return; }
+     const up = createHelperUpdate({ helperExe: CAPTURE_EXE, appVersion: APP_VERSION, asset });
+     (present ? up.refresh() : up.install()).then(status => {
+       learnCaptureFeatures();
+diff --git a/server/updates/self-update-support.js b/server/updates/self-update-support.js
+index aea7de0..7e117b6 100644
+--- a/server/updates/self-update-support.js
++++ b/server/updates/self-update-support.js
+@@ -28,6 +28,8 @@ function makeSupport({ root, f, platform, isPosix, applierPath }) {
+   // antivirus quarantines), or there is no applier for this OS at all.
+   function unsupportedReason() {
+     if (platform !== 'win32' && !isPosix) return 'unsupported_platform';
++    // nixpkgs: the install tree is read-only and updated by Nix.
++    return 'unsupported_platform';
+     try {
+       if (isGitCheckout()) return 'git_checkout';
+       if (!f.existsSync(applierPath)) return 'no_applier';
